@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Extract FortiGate Config</title>
+  
+  <!-- DataTables CSS -->
+  <link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/1.13.7/css/jquery.dataTables.min.css">
+  <!-- jQuery -->
+  <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+  <!-- DataTables JS -->
+  <script src="https://cdn.datatables.net/v/dt/dt-1.13.8/datatables.min.js"></script>
+
+  <style>
+    tr:nth-child(even) {background-color: #f2f2f2;}
+    
+    tr {
+         background-color: #f2fdfc;
+    }
+    
+    tr.odd {
+        background-color: #e4f8ff;
+    }
+    
+    .toggle-div::before {
+        content: "\25B6";
+    }
+    
+    .toggle-div.hidden::before {
+    content: "\25BC";
+    }
+    
+    h2~div { /*div sibling of an element h2 */
+        margin-left: 1em;
+    }
+    h3~div {
+        margin-left: 2em;
+    }
+    .main {
+        border: 1px black dashed;
+    }
+  </style>
+</head>
+<body>
+    <fieldset>
+        <legend>Settings</legend>
+        <label for="fileInput">Select FGT Config: </label><input type="file" id="fileInput" />
+        <input type="button" id="hideH2" value="Hide VDOM">
+        <input type="button" id="hideH3" value="Hide config">
+    </fieldset>
+    <div id="Extract" class="main">
+        <h2 class="toggle-div">Configuration Extract</h2>
+    </div>
+    <div id="Diagramm" class="main">
+        <h2 class="toggle-div">Diagramm Format</h2>
+        <div>
+            <table id="diagramm_Table">
+            </table>
+        </div>
+    </div>
+    <div id="RawConfig" class="main">
+        <h2 class="toggle-div">Raw Configuration extract</h2>
+        <textarea cols="40" rows="5" id="configKey" value="">config system global
+config router ospf
+        </textarea><input type="button" id="get_raw_config" value="Get config" onclick="getRawConfig()"><br>
+
+        <div id="outputRawConfig">
+
+        </div>
+    </div>
+
+<script>
+
+let g_parsedConfig = {};
+let fullConfigText = [];
+
+function findNextNonEmptyIndex(array, startIndex) {
+  // Ensure startIndex is within valid range
+  if (startIndex < 0 || startIndex >= array.length) {
+    return -1; // Invalid index
+  }
+
+  // Start from the next index and search for a non-empty string
+  for (let i = startIndex; i < array.length; i++) {
+    if (array[i].trim() !== '') {
+      return i; // Found the next non-empty index
+    }
+  }
+
+  return -1; // No non-empty string found
+}
+
+
+function extractConfigBlock(configText, currentIndex) {
+    let block = "";
+    let trimmedLine = configText[currentIndex].trim();
+    let nextBlockIndex = -1;
+
+    if (trimmedLine.startsWith("edit")) {
+        let edit_level = 0;
+        let nextIndex = -1;
+        for (let lineIndex = currentIndex; lineIndex < configText.length; lineIndex++) {
+            const line = configText[lineIndex].trim()
+                if (line.startsWith("edit")) {
+                    edit_level += 1;
+                } else if (line === "next") {
+                    edit_level -= 1;
+                }
+                if (edit_level == 0) {
+                    nextIndex = lineIndex;
+                    break;
+                }
+        }
+        block = configText.slice(currentIndex, nextIndex + 1);
+        nextBlockIndex = nextIndex + 1;
+    } else if (trimmedLine.startsWith("config")) {
+        let config_level = 0;
+        let endIndex = -1;
+        for (let lineIndex = currentIndex; lineIndex < configText.length; lineIndex++) {
+            const line = configText[lineIndex].trim()
+                if (line.startsWith("config")) {
+                    config_level += 1;
+                } else if (line === "end") {
+                    config_level -= 1;
+                }
+                if (config_level == 0) {
+                    endIndex = lineIndex;
+                    break;
+                }
+        }
+        block = configText.slice(currentIndex, endIndex + 1);
+        nextBlockIndex = endIndex + 1;
+    }
+    return [block, nextBlockIndex];
+}
+
+//Extrait les commandes du block de configuration
+function extratCmd(fullBlockText, configFields) {
+    const fieldValues = configFields["config"].map(field => {
+        const fieldLine = fullBlockText.find(l => l.trim().startsWith(field));
+
+        if (fieldLine) { //Si on l'a trouvé, on affiche la valeure
+            return fieldLine.split(field)[1].trim();
+        } else if (configFields && configFields.default) { //Si on a un defaut on l'affiche
+            return configFields.default[configFields.config.indexOf(field)] || "?";
+        } else {
+            return "?";
+        }
+    });
+    return fieldValues;
+}
+//On Donne tout le config, pour extraire les différents "edit"
+//configText: le block de configuration commencant par "config" et finissant par "end"
+//configFields: un dictionnaire des champs à extraire
+//    {
+//        "type": "edit",
+//        "config": ["set status", "set ip"],
+//        "name": ["Status", "IP"],
+//        "default": ["Down", "0.0.0.0"]
+//    }
+//retourne: un tableau
+function extractEdit(configText, configFields) {
+    result = [];
+    for (let i = 0; i < configText.length; i++) {
+        const trimmedLine = configText[i].trim();
+        if (trimmedLine && trimmedLine.startsWith("edit")) {
+            const [fullBlockText, endIndex] = extractConfigBlock(configText, i);
+
+            const [, index] = trimmedLine.match(/edit (.+)/) || [];
+
+            const fieldValues = extratCmd(fullBlockText, configFields)
+            result.push([index, ...fieldValues, fullBlockText.join("\n")]);
+        }
+    }
+    return result;
+}
+// Parse la configuration, entière si pas de vdom, ou un vdom
+function parseVDOMConfigText(configTextlines, configDict) {
+    const result = {};
+    let i = 0;
+    while (i < configTextlines.length) {
+        const trimmedLine = configTextlines[i].trim();
+
+        if (configDict.hasOwnProperty(trimmedLine)) { //Si la ligne correspond à une clef du configDict
+            console.log(`Enter: '${trimmedLine}'`)
+            currentConfig = trimmedLine;
+            const configFields = configDict[currentConfig];
+
+            result[currentConfig] = [];
+
+            const [fullBlockText, endIndex] = extractConfigBlock(configTextlines, i);
+            if (configDict[currentConfig]["type"] == "edit") {
+                result[currentConfig] = extractEdit(fullBlockText, configFields)
+            } else {
+                result[currentConfig] = [[trimmedLine, ...extratCmd(fullBlockText, configFields), fullBlockText.join("\n")]]
+            }
+            i =  endIndex;
+        } else {
+            i++;
+        }
+    }
+    return result;
+}
+
+// Function to parse the configuration
+function parseConfigText(configText, configDict) {
+    const result = {};
+
+    const configTextlines = configText.split('\n');
+    g_fullConfigText = configTextlines; // store in global variable for raw config extract
+
+    let currentConfig = null;
+    let vdom_enabled = 0;
+
+    if (configTextlines[0].match(/vdom=1/)) {
+        vdom_enabled = 1;
+        console.log("VDOM enabled");
+    } else if (configTextlines[0].match(/vdom=0/)) {
+        console.log("VDOM disabled");
+    } else {
+        console.log("VDOM unknown");
+    }
+
+    if (vdom_enabled) {
+        console.log("VDOM extract")
+        let index = configTextlines.indexOf("config global\r");
+        let [globbalConfLines, endIndex] = extractConfigBlock(configTextlines, index);
+        result["global"] = parseVDOMConfigText(globbalConfLines, configDict);
+
+        index = findNextNonEmptyIndex(configTextlines, endIndex);
+        if (configTextlines[index].startsWith("config vdom")) {
+            index = findNextNonEmptyIndex(configTextlines, index + 1); //must be edit "vdom name"
+            //while (index > -1) { //other vdom
+            while (configTextlines[index].match(/edit (.+)/)) {
+                [globbalConfLines, endIndex] = extractConfigBlock(configTextlines, index);
+
+                //console.log(globbalConfLines[0]);
+                //console.log(configTextlines[index]);
+                //console.log(index);
+                //console.log(endIndex);
+                let [, vdom_name] = globbalConfLines[0].match(/edit (.+)/) || [];
+                console.log(vdom_name);
+                vdom_name = (globbalConfLines.indexOf("set opmode transparent\r") >0)? `${vdom_name} (Transparent)`:`${vdom_name} (NAT)`;
+                result[vdom_name] = parseVDOMConfigText(globbalConfLines, configDict);
+                
+                index = findNextNonEmptyIndex(configTextlines, endIndex + 1); //must be edit "vdom name"                
+            };
+        } else {
+            console.log("Error no vdom found after global config");
+        }
+    } else {
+        result["root"] = parseVDOMConfigText(configTextlines, configDict);
+    }
+    console.log(result)
+    return result;
+}
+function displayParsedConfig(parsedConfig) {
+    //const body = document.body;
+    const body = document.getElementById("Extract");
+
+    for (const vdomName in parsedConfig) {
+        const vdomDiv = document.createElement("div");
+        vdomDiv.innerHTML = `<h2 class="toggle-div">${vdomName}</h2>`;
+
+        for (const configName in parsedConfig[vdomName]) {
+            // Check if the property is directly defined on the object (not inherited) = Object.keys(vdomName)
+            if (parsedConfig[vdomName].hasOwnProperty(configName)) {
+                const configData = parsedConfig[vdomName][configName];
+
+                const configDiv = document.createElement("div");
+                configDiv.innerHTML = `<h3 class="toggle-div">${configName}</h2>`;
+
+                if (configData.length === 0) {
+                    const noEditsParagraph = document.createElement("p");
+                    noEditsParagraph.textContent = "No internal edits found.";
+                    configDiv.appendChild(noEditsParagraph);
+                } else {
+                    const table = document.createElement("table");
+                    table.classList.add("config_table", "stripe");
+                    // Extract the field names from the configDict
+                    const fieldNames = configDict[configName]["name"];
+                    const tableHeader = document.createElement("thead");
+                    const headerRow = document.createElement("tr");
+
+                    headerRow.appendChild(document.createElement("th")).textContent = "Name";
+
+                    for (const fieldName of fieldNames) {
+                        const th = document.createElement("th");
+                        th.textContent = fieldName;
+                        headerRow.appendChild(th);
+                    }
+                    headerRow.appendChild(document.createElement("th")).textContent = "Config";
+
+                    tableHeader.appendChild(headerRow);
+                    table.appendChild(tableHeader);
+
+                    // Put data inside
+                    const tableBody = document.createElement("tbody");
+                    for (const configItems of configData) {
+                        const row = document.createElement("tr");
+
+                        for (const configItem of configItems) {
+                            const td = document.createElement("td");
+                            td.innerHTML = configItem.replace(/\n/g, '<br>');
+                            row.appendChild(td);
+                        }
+                        tableBody.appendChild(row);
+                    }
+                    table.appendChild(tableBody);
+                    configDiv.appendChild(table);
+                }
+
+                vdomDiv.appendChild(configDiv);
+            }
+        }
+        body.appendChild(vdomDiv);
+    }
+}
+
+const configDict = {
+    "config system ha": {
+        "type": "single",
+        "config": ["set mode"],
+        "name": ["Mode"],
+        "default": ["standalone"]
+    },
+    "config system interface": {
+        "type": "edit",
+        "config": ["set status", "set ip", "set type", "set interface", "set member"],
+        "name": ["Status", "IP", "Type", "Interface", "Member"],
+        "default": ["up", "0.0.0.0", "vlan", "N/A", "N/A"]
+    },
+    "config vpn ipsec phase1-interface": {
+        "type": "edit",
+        "config": ["set type"],
+        "name": ["Type"],
+        "default": ["static"]
+    },
+    "config router static": {
+        "type": "edit",
+        "config": ["set dst", "set device", "set comment"],
+        "name": ["Dst", "Device", "Comment"],
+        "default": ["Default", "?", ""]
+    },
+    "config router bgp": {
+        "type": "single",
+        "config": [],
+        "name": []
+    },
+    "config router ospf": {
+        "type": "single",
+        "config": [],
+        "name": []
+    },
+    "config router route-map": {
+        "type": "single",
+        "config": [],
+        "name": []
+    },
+    "config router prefix-list": {
+        "type": "single",
+        "config": [],
+        "name": []
+    },
+    "config firewall policy": {
+        "type": "edit",
+        "config": ["set name", "set action", "set srcintf", "set dstintf"],
+        "name": ["", "deny", "srcintf", "dstintf"],
+        "default": ["", "deny", "any", "any"]
+    }
+
+};
+
+
+document.getElementById('fileInput').addEventListener('change', function (event) {
+    const fileInput = event.target;
+    const file = fileInput.files[0];
+
+    if (file) {
+        const reader = new FileReader();
+
+        reader.onload = function (e) {
+            const configText = e.target.result;
+            g_fullConfigText = configText;
+            //const configArray = ["config system interface", "config vpn ipsec phase1-interface"];
+
+            // Remove all div elements from the body
+            //document.body.querySelectorAll('div').forEach(div => div.remove());
+            $("#Extract").html('<h2 class="toggle-div">Configuration Extract</h2>');
+            $("#diagramm_Table thead").remove();
+            $("#diagramm_Table tbody").remove();
+
+            console.log(`Load config file ${fileInput.files[0].name}`);
+            const parsedConfig = parseConfigText(configText, configDict);
+            displayParsedConfig(parsedConfig);
+            g_parsedConfig = parsedConfig;
+            parseForDiagramm();
+            $('.config_table').DataTable();
+
+            $('.toggle-div').click(function () {
+                //$(this).next().toggle();
+                $(this).closest('div').find('div').toggle();
+                $(this).toggleClass('hidden');
+            });
+            
+            
+            toggleAllElements('h3');
+
+            
+            configSummary = parseForDiagramm();
+            display_dict_diagramm(configSummary);
+
+        };
+
+        reader.readAsText(file);
+    }
+});
+
+  function toggleAllElements(tagName) {
+    document.querySelectorAll(tagName).forEach(function (element) {
+      var divs = element.parentElement.querySelectorAll('div');
+      divs.forEach(function (div) {
+        //div.style.display = div.style.display === 'none' ? '' : 'none';
+        div.style.display = 'none';
+      });
+      element.classList.toggle('hidden');
+    });
+  }
+
+document.getElementById('hideH2').addEventListener('click', function (event) {
+    toggleAllElements('h2')
+});
+document.getElementById('hideH3').addEventListener('click', function (event) {
+    toggleAllElements('h3');
+});
+
+function areInSameNetwork(ip1, ip2, subnetMask) {
+    const ipToLong = (ip) => ip.split('.').reduce((acc, octet, index) => acc + parseInt(octet) * Math.pow(256, 3 - index), 0);
+    
+    //console.log(`${ip1}--${ip2}--${subnetMask}`)
+    const net1 = ipToLong(ip1) & ipToLong(subnetMask);
+    const host = ipToLong(ip2) & ipToLong(subnetMask);
+    
+    return net1 === host;
+}
+
+function extractIPFromEditLine(line) {
+    const ipRegex = /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/;
+    const editIpRegex = new RegExp(`edit\\s+"(${ipRegex.source})"`);
+
+    const match = line.match(editIpRegex);
+    return match ? match[1] : ''; // Return the captured IP or an empty string
+}
+
+function testIPFromPrefixLine(line, interface_ip) {
+    const ipRegex = /\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/;
+    const editIpRegex = new RegExp(`set prefix\\s+(${ipRegex.source})\\s+(${ipRegex.source})`);
+
+    const match = line.match(editIpRegex);
+    if (match){
+        const prefix_IP=match[1];        
+        const prefix_MASK=match[2];
+
+        if (areInSameNetwork(interface_ip, prefix_IP, prefix_MASK))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+function parseForDiagramm() {
+    my_dict = {}
+
+    for (const vdomName in g_parsedConfig) {
+        for (const interface_id in g_parsedConfig[vdomName]["config system interface"]) {
+            interface = g_parsedConfig[vdomName]["config system interface"][interface_id];
+            const [NAME, STATUS, IP, TYPE, INTERFACE, MEMBER] = [0, 1, 2, 3, 4, 5];
+            //["name", "Status", "IP", "Type", "Status"]
+            if ((interface[TYPE] != "physical") || (((interface[TYPE] == "physical") && (interface[STATUS] == "up") && (interface[IP] != "0.0.0.0")))) {
+                my_dict[interface[NAME]] = {};
+                my_dict[interface[NAME]]["IP"] = interface[IP];
+                my_dict[interface[NAME]]["TYPE"] = interface[TYPE];
+                my_dict[interface[NAME]]["INTERFACE"] = (interface[INTERFACE] == "N/A")? interface[MEMBER]: interface[INTERFACE];
+                my_dict[interface[NAME]]["STATIC_ROUTE"] = 0;
+                my_dict[interface[NAME]]["BGP"] = "Unknown";
+                my_dict[interface[NAME]]["OSPF"] = "Unknown";
+                let index = 0;
+                //Section router static
+                const static_routes = g_parsedConfig[vdomName]["config router static"];
+                for (let i = 0; i < static_routes.length; i++) {
+                    if (static_routes[i][2].includes(interface[NAME]))
+                    {
+                        //console.log(`Static route trouvée pour ${interface[NAME]}: ID ${static_routes[i][0]}`);
+
+                        my_dict[interface[NAME]]["STATIC_ROUTE"] += 1
+                    }
+                }
+                //Section router BGP
+                const [local_ip, local_mask] = my_dict[interface[NAME]]["IP"].split(" ");
+                if ((local_ip == undefined) || (local_mask == undefined) || (local_ip == "0.0.0.0")) {
+                    //Ignore BGP
+                } else {
+                    if ("config router bgp" in g_parsedConfig[vdomName]) {
+                        const bgp_settings = g_parsedConfig[vdomName]["config router bgp"][0][1].split("\n");
+                        for (let i = 0; i < bgp_settings.length; i++) {
+                            
+                            if (bgp_settings[i].includes(interface[NAME])) { // Test if the Interface is in "set interface "xxx""
+                                my_dict[interface[NAME]]["BGP"] = true;
+                                break;
+                            }
+                            else { //Test the neighbor in "edit"
+                                peer_ip = extractIPFromEditLine(bgp_settings[i])
+
+                                if (peer_ip != "") {
+                                    if (areInSameNetwork(local_ip, peer_ip, local_mask))
+                                    {
+                                        my_dict[interface[NAME]]["BGP"] = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                //Section router OSPF
+                
+                if ("config router ospf" in g_parsedConfig[vdomName]) {
+                    const ospf_settings = g_parsedConfig[vdomName]["config router ospf"][0][1].split("\n");
+                    for (let i = 0; i < ospf_settings.length; i++) {
+                        my_dict[interface[NAME]]["OSPF"] = testIPFromPrefixLine(ospf_settings[i], interface[IP])
+
+                        if (my_dict[interface[NAME]]["OSPF"]) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return my_dict;
+}
+
+function display_dict_diagramm(myDict) {
+    const diag_table = $("#diagramm_Table");
+    const thead = $("<thead>");
+    const header_row = $("<tr>");
+    const tbody = $("<tbody>");
+
+    let firstloop = true;
+    // Iterate over dictionary keys
+    $.each(myDict, function (interface_name, interface_value) {
+        if (firstloop) { // Create headers
+            header_row.append($("<th>").text("Interface"));
+        }
+        const row = $("<tr>");
+        row.append($("<td>").text(interface_name));
+
+        $.each(interface_value, function (key, value) {
+            if (firstloop) { // Create headers
+                header_row.append($("<th>").text(key));
+            }
+
+            row.append($("<td>").text(value)); // Convert value to string
+        
+
+        });
+
+        if (firstloop) {
+                firstloop = false;
+            }
+        tbody.append(row);
+    });
+    
+    thead.append(header_row);
+    diag_table.append(thead);
+    diag_table.append(tbody);
+}
+
+function getRawConfig() {
+    $("#outputRawConfig").html("") //Clear the result div
+    let config_key_array = $("#configKey").val().split("\n")
+
+    for (const config_key of config_key_array) {
+        const local_config_key = config_key.trim();
+
+        if (local_config_key != '')
+        {
+            let startIndex = 0;
+        
+            while (startIndex < g_fullConfigText.length) {
+                const trimmedLine = g_fullConfigText[startIndex].trim();
+
+                if (local_config_key == trimmedLine) { //Si la ligne correspond à une clef demandée
+                    console.log(`Enter: '${trimmedLine}'`)
+
+                    const [fullBlockText, endIndex] = extractConfigBlock(g_fullConfigText, startIndex);
+
+                    //document.getElementById("outputRawConfig").value = g_fullConfigText.slice(i,endIndex).join('\n')
+                    const textareaElement = document.createElement("textarea");
+                    textareaElement.value = g_fullConfigText.slice(startIndex,endIndex).join('\n')
+                    textareaElement.rows = 15; // Set the number of rows
+                    textareaElement.cols = 80; // Set the number of columns
+                    document.getElementById("outputRawConfig").appendChild(textareaElement);
+
+                    startIndex =  endIndex;
+                } else {
+                    startIndex++;
+                }
+            }
+        }
+    }
+    $("#outputRawConfig").show()
+}
+
+
+</script>
+<body>
+</body>
